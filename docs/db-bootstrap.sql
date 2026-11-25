@@ -1,0 +1,336 @@
+-- techx-store bootstrap SQL
+--
+-- Fresh-install script. Run against an empty MySQL 8 database to create
+-- every table, then insert the reference data the app cannot boot without.
+--
+-- Includes the current product catalog (sections 4-5) so a fresh install boots
+-- with a working shop. Divisions and payment methods must stay regardless:
+-- checkout reads divisions for delivery fees and COD eligibility, and the
+-- payment step reads payment_methods.
+--
+-- There is no `categories` table. The shop's five categories live in
+-- `src/lib/categories.ts` and ship with the code, so `products.category_id`
+-- carries no foreign key; the admin product routes validate it against that
+-- list instead.
+--
+-- How to apply:
+--   Local:     mysql -u root -p techx < docs/db-bootstrap.sql
+--   Hostinger: hPanel -> MySQL Databases -> phpMyAdmin -> select the DB ->
+--              Import -> upload this file -> Go.
+--
+-- Every section is hand-maintained: schema from src/db/schema/*.ts, the rest by
+-- editing this file. A generator script used to rewrite sections 2-3 from a live
+-- database; it was removed because its rewrite window ran to the end of the file
+-- and silently deleted the catalog below.
+--
+-- Run order: schema -> divisions -> payment_methods.
+--
+-- Notes:
+--   * site_settings ships empty; rows are inserted at runtime via /admin.
+--   * Product photos, payment QR, and slips live on Cloudflare R2, no
+--     filesystem writes. Uploading via /admin sets has_photos per product.
+--   * After install, grant yourself admin:
+--       UPDATE users SET role='admin' WHERE email='you@example.com';
+
+-- =================================================================
+-- 1. Schema
+-- =================================================================
+CREATE TABLE `addresses` (
+	`id` varchar(36) NOT NULL,
+	`user_id` varchar(36) NOT NULL,
+	`label` varchar(40) NOT NULL,
+	`recipient` varchar(120) NOT NULL,
+	`phone` varchar(20) NOT NULL,
+	`division_id` varchar(40) NOT NULL,
+	`city` varchar(120) NOT NULL,
+	`township` varchar(120) NOT NULL,
+	`street` varchar(200) NOT NULL,
+	`landmark` varchar(200),
+	`telegram_username` varchar(32),
+	`maps_url` varchar(512),
+	`is_default` boolean NOT NULL DEFAULT false,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `addresses_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `accounts` (
+	`userId` varchar(36) NOT NULL,
+	`type` varchar(40) NOT NULL,
+	`provider` varchar(80) NOT NULL,
+	`providerAccountId` varchar(200) NOT NULL,
+	`refresh_token` text,
+	`access_token` text,
+	`expires_at` int,
+	`token_type` varchar(40),
+	`scope` varchar(500),
+	`id_token` text,
+	`session_state` varchar(500),
+	CONSTRAINT `accounts_provider_providerAccountId_pk` PRIMARY KEY(`provider`,`providerAccountId`)
+);
+
+CREATE TABLE `sessions` (
+	`session_token` varchar(255) NOT NULL,
+	`user_id` varchar(36) NOT NULL,
+	`expires` timestamp NOT NULL,
+	CONSTRAINT `sessions_session_token` PRIMARY KEY(`session_token`)
+);
+
+CREATE TABLE `users` (
+	`id` varchar(36) NOT NULL,
+	`name` varchar(120),
+	`email` varchar(254) NOT NULL,
+	`email_verified` timestamp(3),
+	`password_hash` varchar(60),
+	-- NULL means the password has not moved since this column shipped, which
+	-- tells src/lib/auth.ts to accept whatever session token the user holds.
+	-- Set on every password change; a mismatch against the JWT evicts it.
+	`password_changed_at` timestamp(3) NULL,
+	`image` varchar(500),
+	`role` enum('customer','admin') NOT NULL DEFAULT 'customer',
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `users_id` PRIMARY KEY(`id`),
+	CONSTRAINT `users_email_unique` UNIQUE(`email`)
+);
+
+CREATE TABLE `verification_tokens` (
+	`identifier` varchar(254) NOT NULL,
+	`token` varchar(255) NOT NULL,
+	-- Email verification and password reset share this table. Without a
+	-- purpose, a token minted for one is accepted by the other's route.
+	`purpose` enum('verify','reset') NOT NULL DEFAULT 'verify',
+	`expires` timestamp NOT NULL,
+	CONSTRAINT `verification_tokens_identifier_token_pk` PRIMARY KEY(`identifier`,`token`)
+);
+
+CREATE TABLE `cart_items` (
+	`cart_id` varchar(36) NOT NULL,
+	`product_id` varchar(64) NOT NULL,
+	`qty` int NOT NULL,
+	`added_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `cart_items_cart_id_product_id_pk` PRIMARY KEY(`cart_id`,`product_id`)
+);
+
+CREATE TABLE `carts` (
+	`id` varchar(36) NOT NULL,
+	`user_id` varchar(36),
+	`session_id` varchar(36),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `carts_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `divisions` (
+	`id` varchar(40) NOT NULL,
+	`name` varchar(60) NOT NULL,
+	`delivery_fee_mmk` bigint NOT NULL,
+	`cod_allowed` boolean NOT NULL DEFAULT false,
+	`is_blocked` boolean NOT NULL DEFAULT false,
+	`sort_order` int NOT NULL DEFAULT 0,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `divisions_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `product_specs` (
+	`id` bigint AUTO_INCREMENT NOT NULL,
+	`product_id` varchar(64) NOT NULL,
+	`label` varchar(80) NOT NULL,
+	`value` varchar(200) NOT NULL,
+	`sort_order` int NOT NULL DEFAULT 0,
+	CONSTRAINT `product_specs_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `products` (
+	`id` varchar(64) NOT NULL,
+	`slug` varchar(80) NOT NULL,
+	`name` varchar(120) NOT NULL,
+	`category_id` varchar(32) NOT NULL,
+	`price_mmk` bigint NOT NULL,
+	`sale_price_mmk` bigint,
+	`tagline` varchar(200) NOT NULL,
+	`description` text NOT NULL,
+	`swatch` char(7) NOT NULL,
+	`stock_qty` int NOT NULL DEFAULT 0,
+	`low_stock_threshold` int NOT NULL DEFAULT 3,
+	`has_photos` boolean NOT NULL DEFAULT false,
+	`is_active` boolean NOT NULL DEFAULT true,
+	`featured` boolean NOT NULL DEFAULT false,
+	`sort_order` int NOT NULL DEFAULT 0,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `products_id` PRIMARY KEY(`id`),
+	CONSTRAINT `products_slug_unique` UNIQUE(`slug`)
+);
+
+CREATE TABLE `payment_methods` (
+	`id` varchar(40) NOT NULL,
+	`name` varchar(60) NOT NULL,
+	`kind` enum('wallet','cod') NOT NULL,
+	`account_name` varchar(120),
+	`account_phone` varchar(20),
+	`qr_image_url` varchar(255),
+	`instructions_md` text,
+	`sort_order` int NOT NULL DEFAULT 0,
+	`is_active` boolean NOT NULL DEFAULT false,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `payment_methods_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `order_items` (
+	`id` bigint AUTO_INCREMENT NOT NULL,
+	`order_id` varchar(36) NOT NULL,
+	`product_id` varchar(64) NOT NULL,
+	`qty` int NOT NULL,
+	`unit_price_mmk_snapshot` bigint NOT NULL,
+	`list_price_mmk_snapshot` bigint,
+	`name_snapshot` varchar(120) NOT NULL,
+	CONSTRAINT `order_items_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `orders` (
+	`id` varchar(36) NOT NULL,
+	`user_id` varchar(36) NOT NULL,
+	`status` enum('pending_payment','payment_submitted','confirmed','delivered','cancelled') NOT NULL DEFAULT 'pending_payment',
+	`subtotal_mmk` bigint NOT NULL,
+	`delivery_fee_mmk` bigint NOT NULL,
+	`total_mmk` bigint NOT NULL,
+	`shipping_address_id` varchar(36),
+	-- Delivery destination frozen at placement. Address rows stay editable, so
+	-- reading these through the join let a later edit redirect a live order.
+	`ship_recipient` varchar(120),
+	`ship_phone` varchar(20),
+	`ship_telegram` varchar(32),
+	`ship_division_id` varchar(40),
+	`ship_division_name` varchar(60),
+	`ship_city` varchar(120),
+	`ship_township` varchar(120),
+	`ship_street` varchar(200),
+	`ship_landmark` varchar(200),
+	`ship_maps_url` varchar(512),
+	`payment_method_id` varchar(40) NOT NULL,
+	`payment_proof_url` varchar(255),
+	`payment_tx_ref` varchar(120),
+	`payment_ref` varchar(64),
+	`expires_at` timestamp NOT NULL,
+	`notes` text,
+	`placed_at` timestamp NOT NULL DEFAULT (now()),
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `orders_id` PRIMARY KEY(`id`)
+);
+
+CREATE TABLE `reviews` (
+	`id` varchar(36) NOT NULL,
+	`product_id` varchar(64) NOT NULL,
+	`user_id` varchar(36) NOT NULL,
+	`rating` tinyint NOT NULL,
+	`title` varchar(120),
+	`body` text NOT NULL,
+	`status` enum('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+	`verified_purchase` boolean NOT NULL DEFAULT false,
+	`created_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `reviews_id` PRIMARY KEY(`id`),
+	CONSTRAINT `uniq_review_user_product` UNIQUE(`user_id`,`product_id`)
+);
+
+CREATE TABLE `wishlists` (
+	`user_id` varchar(36) NOT NULL,
+	`product_id` varchar(64) NOT NULL,
+	`added_at` timestamp NOT NULL DEFAULT (now()),
+	CONSTRAINT `wishlists_user_id_product_id_pk` PRIMARY KEY(`user_id`,`product_id`)
+);
+
+CREATE TABLE `site_settings` (
+	`key` varchar(80) NOT NULL,
+	`value` text NOT NULL,
+	`updated_at` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	CONSTRAINT `site_settings_key` PRIMARY KEY(`key`)
+);
+
+ALTER TABLE `addresses` ADD CONSTRAINT `addresses_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `addresses` ADD CONSTRAINT `addresses_division_id_divisions_id_fk` FOREIGN KEY (`division_id`) REFERENCES `divisions`(`id`) ON DELETE restrict ON UPDATE no action;
+ALTER TABLE `accounts` ADD CONSTRAINT `accounts_userId_users_id_fk` FOREIGN KEY (`userId`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `sessions` ADD CONSTRAINT `sessions_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `cart_items` ADD CONSTRAINT `cart_items_cart_id_carts_id_fk` FOREIGN KEY (`cart_id`) REFERENCES `carts`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `cart_items` ADD CONSTRAINT `cart_items_product_id_products_id_fk` FOREIGN KEY (`product_id`) REFERENCES `products`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `carts` ADD CONSTRAINT `carts_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `product_specs` ADD CONSTRAINT `product_specs_product_id_products_id_fk` FOREIGN KEY (`product_id`) REFERENCES `products`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `order_items` ADD CONSTRAINT `order_items_order_id_orders_id_fk` FOREIGN KEY (`order_id`) REFERENCES `orders`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `order_items` ADD CONSTRAINT `order_items_product_id_products_id_fk` FOREIGN KEY (`product_id`) REFERENCES `products`(`id`) ON DELETE no action ON UPDATE no action;
+ALTER TABLE `orders` ADD CONSTRAINT `orders_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE no action ON UPDATE no action;
+ALTER TABLE `orders` ADD CONSTRAINT `orders_shipping_address_id_addresses_id_fk` FOREIGN KEY (`shipping_address_id`) REFERENCES `addresses`(`id`) ON DELETE set null ON UPDATE no action;
+ALTER TABLE `orders` ADD CONSTRAINT `orders_payment_method_id_payment_methods_id_fk` FOREIGN KEY (`payment_method_id`) REFERENCES `payment_methods`(`id`) ON DELETE restrict ON UPDATE no action;
+ALTER TABLE `reviews` ADD CONSTRAINT `reviews_product_id_products_id_fk` FOREIGN KEY (`product_id`) REFERENCES `products`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `reviews` ADD CONSTRAINT `reviews_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `wishlists` ADD CONSTRAINT `wishlists_user_id_users_id_fk` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE cascade ON UPDATE no action;
+ALTER TABLE `wishlists` ADD CONSTRAINT `wishlists_product_id_products_id_fk` FOREIGN KEY (`product_id`) REFERENCES `products`(`id`) ON DELETE cascade ON UPDATE no action;
+CREATE INDEX `idx_addresses_user` ON `addresses` (`user_id`);
+CREATE INDEX `idx_accounts_user` ON `accounts` (`userId`);
+CREATE INDEX `idx_carts_user` ON `carts` (`user_id`);
+CREATE INDEX `idx_carts_session` ON `carts` (`session_id`);
+CREATE INDEX `idx_specs_product` ON `product_specs` (`product_id`,`sort_order`);
+CREATE INDEX `idx_products_category` ON `products` (`category_id`);
+CREATE INDEX `idx_products_featured` ON `products` (`featured`);
+CREATE INDEX `idx_products_is_active` ON `products` (`is_active`);
+CREATE INDEX `idx_products_sort` ON `products` (`sort_order`);
+CREATE INDEX `idx_orders_user` ON `orders` (`user_id`);
+CREATE INDEX `idx_orders_status` ON `orders` (`status`);
+CREATE INDEX `idx_orders_placed` ON `orders` (`placed_at`);
+CREATE INDEX `idx_orders_expires` ON `orders` (`status`,`expires_at`);
+CREATE INDEX `idx_reviews_product_status` ON `reviews` (`product_id`,`status`);
+
+-- =================================================================
+-- 2. Divisions (BeeExpress shipping rates)
+-- =================================================================
+INSERT INTO `divisions` (`id`, `name`, `delivery_fee_mmk`, `cod_allowed`, `is_blocked`, `sort_order`) VALUES
+('mandalay', 'Mandalay Region', 3000, 1, 0, 1),
+('yangon', 'Yangon Region', 5000, 1, 0, 2),
+('naypyidaw', 'Naypyidaw Union Territory', 5000, 0, 0, 3),
+('bago', 'Bago Region', 5750, 0, 0, 4),
+('magway', 'Magway Region', 5750, 0, 0, 5),
+('ayeyarwady', 'Ayeyarwady Region', 6250, 0, 0, 6),
+('chin', 'Chin State', 6250, 0, 0, 7),
+('mon', 'Mon State', 6250, 0, 0, 8),
+('shan', 'Shan State', 6500, 0, 0, 9),
+('rakhine', 'Rakhine State', 7000, 0, 0, 10),
+('kachin', 'Kachin State', 8500, 0, 0, 11),
+('tanintharyi', 'Tanintharyi Region', 8500, 0, 0, 12),
+('kayah', 'Kayah State', 0, 0, 1, 13),
+('kayin', 'Kayin State', 0, 0, 1, 14),
+('sagaing', 'Sagaing Region', 0, 0, 1, 15);
+
+
+-- =================================================================
+-- 3. Payment methods
+-- =================================================================
+INSERT INTO `payment_methods` (`id`, `name`, `kind`, `account_name`, `account_phone`, `qr_image_url`, `instructions_md`, `sort_order`, `is_active`) VALUES
+('kbz_pay', 'KBZ Pay', 'wallet', NULL, NULL, NULL, NULL, 1, 0),
+('aya_pay', 'Aya Pay', 'wallet', NULL, NULL, NULL, NULL, 2, 0),
+('uab_pay', 'UAB Pay', 'wallet', NULL, NULL, NULL, NULL, 3, 0),
+('kbz_bank', 'KBZ Bank', 'wallet', NULL, NULL, NULL, NULL, 4, 0),
+('cod', 'Cash on Delivery', 'cod', NULL, NULL, NULL, NULL, 5, 1);
+
+
+
+-- =================================================================
+-- Bootstrap complete.
+-- =================================================================
+-- password reset (feat/password-reset, 738994f). Apply before deploying main.
+ALTER TABLE `users`
+	ADD COLUMN `password_changed_at` timestamp(3) NULL AFTER `password_hash`;
+
+ALTER TABLE `verification_tokens`
+	ADD COLUMN `purpose` enum('verify','reset') NOT NULL DEFAULT 'verify' AFTER `token`;
+
+-- stock reserved at checkout (24a70ca). Applied to production 2026-10-22.
+ALTER TABLE `orders`
+	ADD COLUMN `stock_reserved` boolean NOT NULL DEFAULT false;
+
+-- Item 6: slip rejection reason and payment reminder.
+-- Apply locally and on the server BEFORE running or deploying code that has it:
+-- the app selects these columns by name and fails without them.
+ALTER TABLE `orders`
+	ADD COLUMN `payment_rejection_reason` varchar(500) NULL AFTER `payment_ref`,
+	ADD COLUMN `payment_reminder_sent_at` timestamp NULL DEFAULT NULL AFTER `expires_at`;
